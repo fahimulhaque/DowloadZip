@@ -1,8 +1,4 @@
-
-const fs = require('fs');
 const archiver = require('archiver');
-const path = require('path');
-
 
 exports.downloadZip = (request , respose) => {
 
