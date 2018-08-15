@@ -1,0 +1,16 @@
+{
+  "name": "fileupload",
+  "version": "1.0.0",
+  "description": "This projetc is to test Bulk file upload and bulk file download",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Fahimul Haque",
+  "license": "ISC",
+  "dependencies": {
+    "archiver": "^2.1.1",
+    "express": "^4.16.3"
+  }
+}
