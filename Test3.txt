@@ -1,0 +1,628 @@
+Yes, we can add a linkage feature to your mock API framework so that any payment submitted can be retrieved using a reference number. This enhancement allows you to maintain a connection between payment submissions and their retrievals, which is particularly useful for simulating banking APIs in a testing or development environment. Below, I’ll outline how to achieve this by introducing data persistence and modifying your API behavior based on your OpenAPI specification.
+
+---
+
+### Approach
+To enable this linkage, we need to:
+1. **Store Payment Data**: When a payment is submitted (e.g., via a `POST /payments` request), generate a unique reference number and store the payment details.
+2. **Retrieve Payment Data**: Allow retrieval of the stored payment details using the reference number (e.g., via a `GET /payments/{referenceNumber}` request).
+3. **Keep It Simple**: Since this is a mock API, use an in-memory data store instead of a full database, ensuring simplicity and ease of implementation.
+4. **Leverage OpenAPI Spec**: Use custom extensions in the OpenAPI specification to define which endpoints should store or retrieve data.
+
+Here’s how we can implement this step-by-step.
+
+---
+
+### Step 1: Define the OpenAPI Specification
+First, update your OpenAPI specification to include endpoints for submitting and retrieving payments, along with custom extensions (`x-mock-store` and `x-mock-retrieve`) to control the linkage behavior.
+
+```yaml
+openapi: 3.0.0
+info:
+ title: Banking API
+ version: 1.0.0
+paths:
+ /payments:
+ post:
+ x-mock-store:
+ referenceField: reference # Field in the response to hold the reference number
+ requestBody:
+ required: true
+ content:
+ application/json:
+ schema:
+ type: object
+ properties:
+ amount:
+ type: number
+ currency:
+ type: string
+ responses:
+ '201':
+ description: Payment created
+ content:
+ application/json:
+ schema:
+ type: object
+ properties:
+ reference:
+ type: string
+ status:
+ type: string
+ /payments/{reference}:
+ get:
+ x-mock-retrieve:
+ param: reference # Path parameter to use for retrieval
+ parameters:
+ - name: reference
+ in: path
+ required: true
+ schema:
+ type: string
+ responses:
+ '200':
+ description: Payment details
+ content:
+ application/json:
+ schema:
+ type: object
+ properties:
+ amount:
+ type: number
+ currency:
+ type: string
+ status:
+ type: string
+ '404':
+ description: Payment not found
+```
+
+- **`x-mock-store`**: Indicates that the `POST /payments` endpoint should store the request body and generate a reference number, placing it in the `reference` field of the response.
+- **`x-mock-retrieve`**: Indicates that the `GET /payments/{reference}` endpoint should retrieve stored data using the `reference` path parameter.
+
+---
+
+### Step 2: Modify the Mock API Server
+Next, update your server code to handle these extensions by adding an in-memory data store and logic to store and retrieve payments.
+
+#### Prerequisites
+Install the `uuid` package to generate unique reference numbers:
+```bash
+npm install uuid
+```
+
+#### Updated Server Code (`server.js`)
+Here’s the enhanced implementation:
+
+```javascript
+const express = require('express');
+const OpenApiValidator = require('express-openapi-validator');
+const SwaggerParser = require('swagger-parser');
+const fs = require('fs').promises;
+const yaml = require('js-yaml');
+const { generateResponse } = require('./responseGenerator');
+const logger = require('./logger');
+const { v4: uuidv4 } = require('uuid');
+
+// In-memory data store for payments
+const dataStore = new Map();
+
+async function startServer({ specPath, staticPath, port }) {
+ const app = express();
+ app.use(express.json());
+
+ // Load and validate OpenAPI spec
+ let spec;
+ try {
+ const specContent = await fs.readFile(specPath, 'utf8');
+ spec = specPath.endsWith('.yaml') ? yaml.load(specContent) : JSON.parse(specContent);
+ await SwaggerParser.validate(spec);
+ } catch (error) {
+ throw new Error(`Invalid OpenAPI spec: ${error.message}`);
+ }
+
+ // Load static responses if provided
+ let staticResponses = {};
+ if (staticPath) {
+ try {
+ staticResponses = JSON.parse(await fs.readFile(staticPath, 'utf8'));
+ } catch (error) {
+ throw new Error(`Invalid static responses file: ${error.message}`);
+ }
+ }
+
+ // Install OpenAPI validator
+ app.use(
+ OpenApiValidator.middleware({
+ apiSpec: spec,
+ validateRequests: true,
+ validateResponses: false,
+ validateSecurity: {
+ handlers: {
+ ApiKeyAuth: (req, scopes, schema) => !!req.headers['x-api-key'],
+ BearerAuth: (req, scopes, schema) => !!req.headers['authorization']
+ }
+ }
+ })
+ );
+
+ // Error handling for validation
+ app.use((err, req, res, next) => {
+ if (err.status) {
+ logger.error(`Validation failed: ${err.message}`);
+ return res.status(err.status).json({ error: err.message, details: err.errors });
+ }
+ next(err);
+ });
+
+ // Dynamic route handler
+ Object.entries(spec.paths).forEach(([path, methods]) => {
+ Object.entries(methods).forEach(([method, operation]) => {
+ const handler = async (req, res) => {
+ const requestedStatus = req.headers['x-mock-response'] || '200';
+
+ // Handle retrieval of stored data
+ if (operation['x-mock-retrieve']) {
+ const { param } = operation['x-mock-retrieve'];
+ const reference = req.params[param];
+ const data = dataStore.get(reference);
+ if (data) {
+ logger.info({ path: req.path, method: req.method, status: 200, response: data });
+ return res.status(200).json(data);
+ } else {
+ logger.info({ path: req.path, method: req.method, status: 404, response: { error: 'Not found' } });
+ return res.status(404).json({ error: 'Not found' });
+ }
+ }
+
+ // Generate standard response
+ const response = await generateResponse({
+ path,
+ method,
+ operation,
+ staticResponses,
+ requestedStatus
+ });
+
+ // Handle storing of new data
+ if (operation['x-mock-store']) {
+ const { referenceField } = operation['x-mock-store'];
+ const reference = uuidv4(); // Generate unique reference
+ dataStore.set(reference, req.body); // Store payment data
+ if (response.body && referenceField) {
+ response.body[referenceField] = reference; // Add reference to response
+ }
+ }
+
+ logger.info({ path: req.path, method: req.method, status: response.status, response: response.body });
+ res.status(response.status).json(response.body);
+ };
+
+ app[method.toLowerCase()](path.replace(/\{([^}]+)\}/g, ':$1'), handler);
+ });
+ });
+
+ // Start server
+ return new Promise((resolve) => {
+ app.listen(port, () => resolve());
+ });
+}
+
+module.exports = { startServer };
+```
+
+---
+
+### How It Works
+1. **Data Storage**:
+ - A global `Map` called `dataStore` is created at the module level, ensuring it persists across requests in the Node.js process.
+ - Keys are unique reference numbers (UUIDs), and values are the payment data from the request body.
+
+2. **Submitting a Payment (`POST /payments`)**:
+ - When a `POST /payments` request is received, the handler checks for the `x-mock-store` extension.
+ - A unique reference number is generated using `uuidv4()`.
+ - The request body (e.g., `{ "amount": 100, "currency": "USD" }`) is stored in `dataStore` with the reference as the key.
+ - The response is generated based on the spec (e.g., status `201`), and the `reference` field is set to the generated reference (e.g., `{ "reference": "550e8400-e29b-41d4-a716-446655440000", "status": "pending" }`).
+
+3. **Retrieving a Payment (`GET /payments/{reference}`)**:
+ - When a `GET /payments/{reference}` request is received, the handler checks for the `x-mock-retrieve` extension.
+ - The reference number is extracted from the path parameter (e.g., `req.params.reference`).
+ - The handler looks up the reference in `dataStore`:
+ - If found, it returns the stored data with a `200` status (e.g., `{ "amount": 100, "currency": "USD" }`).
+ - If not found, it returns a `404` with `{ "error": "Not found" }`.
+
+4. **Logging**:
+ - All requests and responses are logged using the `logger` module for debugging and verification.
+
+---
+
+### Example Usage
+1. **Submit a Payment**:
+ ```bash
+ curl -X POST http://localhost:3000/payments \
+ -H "Content-Type: application/json" \
+ -d '{"amount": 100, "currency": "USD"}'
+ ```
+ **Response**:
+ ```json
+ {
+ "reference": "550e8400-e29b-41d4-a716-446655440000",
+ "status": "pending"
+ }
+ ```
+
+2. **Retrieve the Payment**:
+ ```bash
+ curl http://localhost:3000/payments/550e8400-e29b-41d4-a716-446655440000
+ ```
+ **Response**:
+ ```json
+ {
+ "amount": 100,
+ "currency": "USD"
+ }
+ ```
+
+3. **Retrieve a Non-Existent Payment**:
+ ```bash
+ curl http://localhost:3000/payments/invalid-reference
+ ```
+ **Response**:
+ ```json
+ {
+ "error": "Not found"
+ }
+ ```
+
+---
+
+### Notes
+- **Simplicity**: The in-memory `Map` keeps the implementation lightweight, suitable for a mock API. However, data is lost if the server restarts. For persistence, you could extend this to write to a file or use a lightweight database like SQLite, but that’s optional.
+- **Schema Consistency**: The stored request body is returned as-is for retrieval. If the `POST` request body and `GET` response schemas differ significantly, you may need to adjust the spec or add logic to transform the data, but this is kept simple here.
+- **Extensibility**: You can later add support for updating (`PUT`) or deleting (`DELETE`) payments by introducing `x-mock-update` and `x-mock-delete` extensions if needed.
+
+---
+
+### Conclusion
+With these changes, your mock API now supports linking APIs by allowing payments submitted via `POST /payments` to be retrieved using a reference number via `GET /payments/{reference}`. This is achieved through an in-memory store and custom OpenAPI extensions, providing a flexible and straightforward solution for your banking API mock framework. Let me know if you need further refinements! 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Let's create a comprehensive Node.js-based mock API framework that meets these requirements. Here's a detailed solution:
+
+### Architecture Overview
+
+The framework consists of these main components:
+1. **Spec Parser**: Loads and validates the OpenAPI specification
+2. **Server Setup**: Configures Express.js with dynamic routes
+3. **Request Validator**: Validates incoming requests against the spec
+4. **Response Generator**: Handles both static and dynamic responses
+5. **CLI Handler**: Processes command-line arguments
+6. **Logger**: Records requests and responses
+
+### Implementation
+
+First, let's create the main files:
+
+#### 1. `package.json`
+```json
+{
+  "name": "mock-api",
+  "version": "1.0.0",
+  "main": "index.js",
+  "bin": {
+    "mock-api": "./index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-openapi-validator": "^5.1.0",
+    "json-schema-faker": "^0.5.5",
+    "swagger-parser": "^10.0.3",
+    "commander": "^11.1.0",
+    "winston": "^3.11.0",
+    "js-yaml": "^4.1.0"
+  }
+}
+```
+
+#### 2. `index.js` (Main Entry Point)
+```javascript
+#!/usr/bin/env node
+
+const program = require('commander');
+const { startServer } = require('./server');
+const logger = require('./logger');
+
+program
+  .option('--spec <path>', 'Path to OpenAPI spec file', 'openapi.yaml')
+  .option('--static <path>', 'Path to static responses file')
+  .option('--port <number>', 'Server port', parseInt, 3000)
+  .parse(process.argv);
+
+const options = program.opts();
+
+async function main() {
+  try {
+    await startServer({
+      specPath: options.spec,
+      staticPath: options.static,
+      port: options.port
+    });
+    logger.info(`Mock API server running on port ${options.port}`);
+  } catch (error) {
+    logger.error(`Failed to start server: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+main();
+```
+
+#### 3. `server.js` (Server Logic)
+```javascript
+const express = require('express');
+const OpenApiValidator = require('express-openapi-validator');
+const SwaggerParser = require('swagger-parser');
+const fs = require('fs').promises;
+const yaml = require('js-yaml');
+const { generateResponse } = require('./responseGenerator');
+const logger = require('./logger');
+
+async function startServer({ specPath, staticPath, port }) {
+  const app = express();
+  app.use(express.json());
+
+  // Load and validate OpenAPI spec
+  let spec;
+  try {
+    const specContent = await fs.readFile(specPath, 'utf8');
+    spec = specPath.endsWith('.yaml') ? yaml.load(specContent) : JSON.parse(specContent);
+    await SwaggerParser.validate(spec);
+  } catch (error) {
+    throw new Error(`Invalid OpenAPI spec: ${error.message}`);
+  }
+
+  // Load static responses if provided
+  let staticResponses = {};
+  if (staticPath) {
+    try {
+      staticResponses = JSON.parse(await fs.readFile(staticPath, 'utf8'));
+    } catch (error) {
+      throw new Error(`Invalid static responses file: ${error.message}`);
+    }
+  }
+
+  // Install OpenAPI validator
+  app.use(
+    OpenApiValidator.middleware({
+      apiSpec: spec,
+      validateRequests: true,
+      validateResponses: false,
+      validateSecurity: {
+        handlers: {
+          ApiKeyAuth: (req, scopes, schema) => {
+            return !!req.headers['x-api-key']; // Check presence only
+          },
+          BearerAuth: (req, scopes, schema) => {
+            return !!req.headers['authorization']; // Check presence only
+          }
+        }
+      }
+    })
+  );
+
+  // Error handling for validation
+  app.use((err, req, res, next) => {
+    if (err.status) {
+      logger.error(`Validation failed: ${err.message}`);
+      return res.status(err.status).json({
+        error: err.message,
+        details: err.errors
+      });
+    }
+    next(err);
+  });
+
+  // Dynamic route handler
+  Object.entries(spec.paths).forEach(([path, methods]) => {
+    Object.entries(methods).forEach(([method, operation]) => {
+      const handler = async (req, res) => {
+        const requestedStatus = req.headers['x-mock-response'] || '200';
+        const response = await generateResponse({
+          path,
+          method,
+          operation,
+          staticResponses,
+          requestedStatus
+        });
+
+        logger.info({
+          path: req.path,
+          method: req.method,
+          status: response.status,
+          response: response.body
+        });
+
+        res.status(response.status).json(response.body);
+      };
+
+      app[method.toLowerCase()](path.replace(/\{([^}]+)\}/g, ':$1'), handler);
+    });
+  });
+
+  // Start server
+  return new Promise((resolve) => {
+    app.listen(port, () => resolve());
+  });
+}
+
+module.exports = { startServer };
+```
+
+#### 4. `responseGenerator.js` (Response Generation Logic)
+```javascript
+const jsf = require('json-schema-faker');
+
+async function generateResponse({ path, method, operation, staticResponses, requestedStatus }) {
+  // Check for static response first
+  const staticKey = `${path}/${method.toUpperCase()}`;
+  if (staticResponses[path]?.[method.toUpperCase()]) {
+    const staticResp = staticResponses[path][method.toUpperCase()];
+    return {
+      status: staticResp.status,
+      body: staticResp.body
+    };
+  }
+
+  // Get available responses from spec
+  const responses = operation.responses || {};
+  const status = requestedStatus in responses ? requestedStatus : '200';
+
+  if (!responses[status]) {
+    return {
+      status: 500,
+      body: { error: `No response defined for status ${status}` }
+    };
+  }
+
+  const responseDef = responses[status];
+  const content = responseDef.content?.['application/json'];
+
+  // Use example if available
+  if (content?.example) {
+    return { status: parseInt(status), body: content.example };
+  }
+
+  // Generate from schema if available
+  if (content?.schema) {
+    const generated = await jsf.resolve(content.schema);
+    return { status: parseInt(status), body: generated };
+  }
+
+  return { status: parseInt(status), body: {} };
+}
+
+module.exports = { generateResponse };
+```
+
+#### 5. `logger.js` (Logging Setup)
+```javascript
+const winston = require('winston');
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'mock-api.log' })
+  ]
+});
+
+module.exports = logger;
+```
+
+### Usage Instructions
+
+1. **Installation**
+```bash
+npm install
+npm link  # Makes the CLI available globally
+```
+
+2. **Create an OpenAPI Spec** (e.g., `openapi.yaml`)
+```yaml
+openapi: 3.0.0
+info:
+  title: Banking API
+  version: 1.0.0
+paths:
+  /accounts/{accountId}:
+    get:
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Account details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  balance: { type: number }
+              example:
+                id: "123"
+                balance: 1000.50
+        '404':
+          description: Account not found
+security:
+  - ApiKeyAuth: []
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+```
+
+3. **Create Static Responses** (e.g., `static.json`)
+```json
+{
+  "/accounts/123": {
+    "GET": {
+      "status": 404,
+      "body": { "error": "Account not found" }
+    }
+  }
+}
+```
+
+4. **Run the Server**
+```bash
+mock-api --spec openapi.yaml --static static.json --port 3000
+```
+
+5. **Test the API**
+```bash
+# Successful request
+curl -H "X-API-Key: test" http://localhost:3000/accounts/456
+
+# Force specific status
+curl -H "X-API-Key: test" -H "X-Mock-Response: 404" http://localhost:3000/accounts/456
+
+# Invalid request (missing header)
+curl http://localhost:3000/accounts/456
+```
+
+### Assumptions and Limitations
+
+**Assumptions:**
+- Responses are JSON-only (application/json)
+- Security schemes check presence of headers but don't validate values
+- Static responses match exact paths (no parameter wildcards)
+
+**Limitations:**
+- No support for XML responses
+- Limited security scheme support (only API Key and Bearer)
+- No custom response generation logic beyond schema/examples
+- Static responses must match exact paths without parameter substitution
+
+This implementation provides a solid foundation for a mock API server that can be extended based on specific needs. It handles banking API requirements well, including complex JSON structures and security header validation, while maintaining flexibility through static and dynamic responses.
